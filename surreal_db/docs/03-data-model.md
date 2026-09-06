@@ -110,7 +110,7 @@ DEFINE FIELD IF NOT EXISTS valid_to   ON fact TYPE option<datetime>;
 DEFINE FIELD IF NOT EXISTS created_at ON fact TYPE datetime DEFAULT time::now();
 
 -- computed field (3.0): current-ness is derived, never set by the application
-DEFINE FIELD IF NOT EXISTS is_current ON fact VALUE valid_to = NONE;
+DEFINE FIELD IF NOT EXISTS is_current ON fact COMPUTED valid_to = NONE;
 
 DEFINE TABLE IF NOT EXISTS episode SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS summary ON episode TYPE string;
@@ -124,8 +124,26 @@ DEFINE FIELD IF NOT EXISTS session  ON retrieval TYPE record<session>;
 DEFINE FIELD IF NOT EXISTS query    ON retrieval TYPE string;
 DEFINE FIELD IF NOT EXISTS strategy ON retrieval TYPE string;        -- hybrid | vector | text | graph
 DEFINE FIELD IF NOT EXISTS surql    ON retrieval TYPE string;        -- what actually ran
-DEFINE FIELD IF NOT EXISTS timing   ON retrieval TYPE object;        -- { total_ms, knn_ms, fts_ms, graph_ms }
-DEFINE FIELD IF NOT EXISTS hits     ON retrieval TYPE array<object>; -- [{ fact, score, via }]
+-- FLEXIBLE because the table is SCHEMAFULL: without it, every key inside a
+-- nested object would have to be declared, and these two are payloads rather
+-- than structure.
+--
+-- OVERWRITE rather than IF NOT EXISTS on the element field: declaring
+-- `hits` as array<object> makes SurrealDB define `hits.*` implicitly, so
+-- IF NOT EXISTS finds it already there and silently keeps the non-FLEXIBLE
+-- version -- which then rejects every write with "no such field exists".
+DEFINE FIELD IF NOT EXISTS hits     ON retrieval TYPE array<object>;  -- [{ fact, score, via }]
+DEFINE FIELD OVERWRITE     hits.*   ON retrieval TYPE object FLEXIBLE;
+DEFINE FIELD OVERWRITE     timing   ON retrieval TYPE object FLEXIBLE;  -- { total_ms, knn_ms, ... }
+
+-- The hit shape, typed explicitly. `fact` matters most: record ids arrive from
+-- any client as plain strings, and declaring the field as record<fact> makes
+-- SurrealDB coerce them on write. Without this the decay event below silently
+-- updates a list of strings, salience never moves, and nothing on screen ever
+-- brightens or fades -- a failure with no error attached to it.
+DEFINE FIELD OVERWRITE     hits.*.fact  ON retrieval TYPE record<fact>;
+DEFINE FIELD OVERWRITE     hits.*.score ON retrieval TYPE float DEFAULT 0.0;
+DEFINE FIELD OVERWRITE     hits.*.via   ON retrieval TYPE string DEFAULT "vector";
 DEFINE FIELD IF NOT EXISTS at       ON retrieval TYPE datetime DEFAULT time::now();
 ```
 
@@ -195,7 +213,7 @@ statement, one transaction, no application-side join.
 
 LET $vec = (
     SELECT id, text, confidence,
-           vector::similarity::cosine(embedding, $q) AS score,
+           vector::distance::knn() AS score,
            "vector" AS via
     FROM fact
     WHERE embedding <|12,64|> $q
@@ -216,12 +234,19 @@ LET $kw = (
 
 -- expand outward from the entities those seeds mention, 1..2 hops
 LET $seeds   = array::distinct(array::concat($vec.id, $kw.id));
-LET $anchors = (SELECT VALUE ->mentions->entity FROM $seeds);
+LET $anchors = array::distinct(array::flatten(
+    (SELECT VALUE ->mentions->entity FROM $seeds)
+));
+
+LET $expanded = array::distinct(array::concat(
+    array::flatten($anchors->relates->entity),
+    array::flatten($anchors.{1..2}->relates->entity)
+));
 
 LET $assoc = (
     SELECT id, text, confidence, 0.4 AS score, "graph" AS via
     FROM fact
-    WHERE ->mentions->entity CONTAINSANY $anchors.{1..2}->relates->entity
+    WHERE ->mentions->entity CONTAINSANY $expanded
       AND valid_to = NONE
       AND id NOTINSIDE $seeds
     LIMIT $k
@@ -232,6 +257,20 @@ RETURN { vector: $vec, text: $kw, graph: $assoc, anchors: $anchors };
 
 `<|12,64|>` is the KNN operator — 12 neighbours, EF search width 64. `@1@` is the full-text match
 operator bound to reference `1`, which `search::score(1)` and `search::highlight(..., 1)` read.
+`vector::distance::knn()` reads back the distance the KNN operator already computed, rather than
+recomputing cosine similarity a second time.
+
+> **Why the association step unions two depths instead of writing `.{1..2}`.**
+> The obvious form — `CONTAINSANY $anchors.{1..2}->relates->entity` — parses, runs, and is wrong.
+> SurrealDB's recursion returns the nodes reached at the *deepest completed depth*, not the union of
+> every depth along the way, so an anchor's immediate neighbour that happens to have no further
+> outgoing edge is dropped from the result entirely. Ana → Acme → Munich contributes Munich; Globex →
+> Berlin, a dead end after one hop, contributes nothing, and every fact about Berlin becomes
+> unreachable. There is no error and no warning — the query simply recalls less than it should.
+>
+> Unioning depth 1 and depth 2 explicitly fixes it. Each depth is flattened separately because
+> `array::flatten` removes a single level and the two arms nest differently. `db/verify.py` runs both
+> forms against the same fixture and asserts on the difference, so this cannot quietly regress.
 
 Fusion (reciprocal rank fusion across the three lists) happens in Python. It is ranking policy, not
 data access, and keeping it out of SurrealQL makes it unit-testable. The fused result plus the
@@ -278,11 +317,12 @@ flowchart LR
 Supersession is one transaction:
 
 ```surql
-BEGIN;
-LET $new = (CREATE fact CONTENT { text: $text, embedding: $emb, confidence: $conf });
+BEGIN TRANSACTION;
+LET $old = type::record($old_id);
+LET $new = (CREATE ONLY fact CONTENT { text: $text, embedding: $emb, confidence: $conf });
 UPDATE $old SET valid_to = time::now();
 RELATE $new->supersedes->$old;
-COMMIT;
+COMMIT TRANSACTION;
 ```
 
 Retrieval filters on `valid_to = NONE`. Time-travel is the same query with
@@ -292,7 +332,8 @@ even though v1 ships no time slider.
 ## Decay — ASYNC, off the write path
 
 ```surql
-DEFINE EVENT IF NOT EXISTS decay_on_retrieval ON TABLE retrieval WHEN $event = "CREATE" THEN ASYNC {
+DEFINE EVENT IF NOT EXISTS decay_on_retrieval ON TABLE retrieval ASYNC
+    WHEN $event = "CREATE" THEN {
     -- reinforce what was just used
     UPDATE $after.hits.*.fact SET salience = math::min([salience * 1.15, 3.0]);
     -- everything else drifts down
@@ -331,11 +372,33 @@ Notes that matter:
 Before any application code exists:
 
 ```bash
-docker run --rm -v "$PWD:/w" surrealdb/surrealdb:v3 \
-  import --conn ws://host.docker.internal:8000 --user root --pass root \
-  --ns cortex --db main /w/schema.surql
+docker compose up -d --wait surrealdb   # starts the server
+docker compose run --rm migrate         # applies this schema
+python db/verify.py                     # proves it does what this document says
 ```
 
-Then in Surrealist: create two contradictory facts, run the supersession transaction, and confirm
-`is_current` flips without anything being deleted. That is the smallest check that the temporal
-model actually works.
+`db/verify.py` needs no virtualenv — standard library only, over the HTTP `/sql` endpoint. It checks
+the two things that would invalidate the design if they were false:
+
+1. **Supersession.** Two contradictory facts, the transaction above, then assert `is_current` flipped
+   on its own, the old fact kept its `valid_to`, the `supersedes` edge points the right way, and
+   **both versions are still retrievable**. Nothing may ever be deleted.
+2. **The hybrid query.** Runs the associative arm both as this document originally wrote it and in
+   the corrected depth-union form, against a fixture containing one fact that is reachable *only* by
+   traversal — two hops from the query's anchors, sharing no keyword with it, embedded far away from
+   it. The corrected form must find it. The naive form must not, which is what keeps that regression
+   from returning.
+
+## SurrealQL notes that cost an hour each
+
+Found while making the above pass on 3.1.6. None of them are documented prominently, and all of them
+fail in ways that look like something else:
+
+| Behaviour | Consequence |
+|---|---|
+| Record ids serialise to plain strings (`"fact:abc"`) in JSON | They must be turned back with `type::record($id)` before use. Passing the string where a record is expected fails the whole transaction with a generic "failed transaction" message that names nothing |
+| `RELATE` will not take an expression as an endpoint | `RELATE $a->edge->type::record($b)` is a parse error. Bind each endpoint to its own parameter first |
+| `ORDER BY` fields must appear in the selection | `SELECT id, text FROM fact ORDER BY created_at` is rejected — "Missing order idiom" |
+| `CREATE` returns an array | Use `CREATE ONLY` anywhere a single record is expected, or every downstream field access is off by one level of nesting |
+| `type::thing` was renamed `type::record` | The 2.x name is gone |
+| The KNN operator returns K neighbours regardless of distance | On a small table it returns the whole table. Anything that then excludes the seed set — as the associative arm does — silently has nothing left to work with |

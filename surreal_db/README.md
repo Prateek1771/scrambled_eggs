@@ -94,12 +94,31 @@ instead — see [04 — Agent](docs/04-agent.md).
 | [05 — UI](docs/05-ui.md) | The live graph, its visual encoding, and the query inspector |
 | [06 — Benchmark](docs/06-benchmark.md) | How we compare against the 5-database stack, honestly |
 | [07 — Roadmap](docs/07-roadmap.md) | Build order, each milestone independently demoable |
+| [08 — Testing](docs/08-testing.md) | The stress suite, what it proves, and the seven things it found |
 
 ---
 
 ## Status
 
-Design complete, implementation not started. Every doc above is written to be built from directly.
+**M0–M4 built and under test.** The schema and migration, the live memory graph,
+and the LangGraph agent all run. Talk to it and the memory forms on screen: facts
+are extracted atomically, entities linked, contradictions superseded rather than
+deleted, and every recall recorded with the exact SurrealQL that produced it.
+Conversation state is checkpointed into SurrealDB, so a restarted API resumes
+mid-thread.
+
+A stress suite covers it: **51 tests** against a simulated engineering
+organisation of **721 entities, 3,439 facts and 11,316 edges** — zero torn reads
+under 50 concurrent writers, a browser that reconverges after the database is
+restarted underneath it, and a real two-turn conversation asserting that
+contradicting a fact ends it without destroying it.
+
+It found fourteen real problems, including a reproducible **SIGSEGV in SurrealDB
+3.1.6** and five errors in these design docs. All are written up with their
+reproductions in [08 — Testing](docs/08-testing.md).
+
+Still to come: M5 (seed data, `web` in compose, a verified one-command
+quickstart), M6's comparison stack, and M7.
 
 Built on [SurrealDB 3.x](https://surrealdb.com/docs). `LIVE SELECT` is single-node only today, so
 CORTEX is a single-node deployment — see [02 — Architecture](docs/02-architecture.md).

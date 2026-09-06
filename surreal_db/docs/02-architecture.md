@@ -39,7 +39,7 @@ The thick line is the demo. Memory updates reach the screen without passing thro
 
 | Container | Image / base | Responsibility |
 |---|---|---|
-| `surrealdb` | `surrealdb/surrealdb:v3` | Everything stateful. Single node, SurrealKV file backend, named volume. |
+| `surrealdb` | `surrealdb/surrealdb:v3` | Everything stateful. Single node, RocksDB file backend, named volume. |
 | `api` | `python:3.12-slim` | FastAPI, the LangGraph agent, embedding calls, trace endpoint. Stateless. |
 | `web` | `node:22-alpine` | Next.js App Router, chat UI, live graph, inspector. Stateless. |
 

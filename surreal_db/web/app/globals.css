@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+/*
+ * Nexura tokens from docs/design.md. Tailwind v4 is CSS-first, so the theme is
+ * declared here rather than in a config file.
+ *
+ * The three recall hues are the one addition. The palette has a single accent,
+ * but semantic, lexical and associative recall have to be told apart at a
+ * glance -- that is information the design system does not carry, so it is added
+ * rather than collapsed into one colour.
+ */
+@theme {
+  --color-bg: #0b0f19;
+  --color-surface: #262a34;
+  --color-border: #262a34;
+  --color-primary: #2d8cff;
+  --color-accent: #2d8cff;
+  --color-fg: #ffffff;
+  --color-muted: #a1a1af;
+
+  /* Recall strategies. Never carried by colour alone -- the inspector labels
+     every hit with its `via`, and node shape backs the hue up. */
+  --color-via-vector: #2d8cff;
+  --color-via-text: #ffb020;
+  --color-via-graph: #ff00a0;
+
+  /* Node families. */
+  --color-node-fact: #cbd5f5;
+  --color-node-person: #6ee7b7;
+  --color-node-place: #fca5a5;
+  --color-node-org: #fcd34d;
+  --color-node-concept: #c4b5fd;
+  --color-node-artifact: #94a3b8;
+  --color-node-event: #f9a8d4;
+
+  --radius-card: 16px;
+  --radius-control: 8px;
+
+  --font-display: "DotGothic16", ui-monospace, monospace;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", monospace;
+}
+
+html,
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* The live indicator. Amber while reconnecting, so a stale graph never looks
+   like a healthy one. */
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.dot-live {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+/* Entry animation for a node that has just been learned. */
+@keyframes node-enter {
+  from {
+    transform: scale(0.2);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.panel {
+  background: var(--color-surface);
+  border: 1px solid color-mix(in srgb, var(--color-border) 70%, white 8%);
+  border-radius: var(--radius-card);
+}
+
+pre.surql {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
