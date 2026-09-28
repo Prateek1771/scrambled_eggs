@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from surrealdb import AsyncSurreal, RecordID
 
 from .config import Settings
+from .telemetry import tracer
 
 logger = logging.getLogger("cortex.db")
 
@@ -122,9 +124,20 @@ class Database:
           becomes two.
         * **Transport failure** -- reconnect once, then retry.
         """
+        # The span records the statement's first line and its retry count, not
+        # its parameters: those carry embeddings and user text, and this table is
+        # readable by anyone with a viewer token.
+        with tracer().start_as_current_span("db.query") as span:
+            span.set_attribute("db.system", "surrealdb")
+            span.set_attribute("db.statement.head", surql.strip().splitlines()[0][:120])
+            return await self._attempt(surql, params, span)
+
+    async def _attempt(self, surql: str, params: dict[str, Any] | None, span) -> Any:
+        """Execute with conflict retry, recording how many attempts it took."""
         import random
 
         for attempt in range(CONFLICT_RETRIES):
+            span.set_attribute("db.retries", attempt)
             try:
                 return self._last(await self._require().query_raw(surql, params or {}))
             except SurrealQueryError as error:
@@ -141,6 +154,42 @@ class Database:
                     await self.close_unlocked()
                     await self._open()
         raise RuntimeError("unreachable")
+
+    async def query_timed(self, surql: str,
+                          params: dict[str, Any] | None = None) -> tuple[Any, list[float]]:
+        """Run SurrealQL and return the last result *and* every statement's duration.
+
+        SurrealDB reports how long each statement took, in the same envelope that
+        carries its result -- `{"status": "OK", "time": "1.65ms", ...}`. Ordinary
+        `query()` discards that.
+
+        It is the only way to time the arms of the hybrid recall separately: all
+        three run inside one statement batch, so a client-side stopwatch can
+        measure the round trip and nothing finer. These are the engine's own
+        numbers, which is both more accurate and a better answer to "how long did
+        the KNN take" than anything measured from outside.
+        """
+        response = await self._require().query_raw(surql, params or {})
+        return self._last(response), self._statement_times(response)
+
+    @staticmethod
+    def _statement_times(response: dict) -> list[float]:
+        """Parse each statement's reported duration into milliseconds.
+
+        Durations arrive as human strings -- `1.65ms`, `430µs`, `2s` -- rather than
+        as numbers, so they are parsed rather than cast. An unrecognised unit
+        yields 0.0: a timing that cannot be read must not take down the query that
+        produced it.
+        """
+        # "µs" is the micro sign SurrealDB actually emits; "us" is accepted
+        # too so the parser survives an encoding that mangles it.
+        units = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1000.0}
+        times: list[float] = []
+        for envelope in response.get("result") or []:
+            raw = str(envelope.get("time", "")).strip()
+            match = re.fullmatch(r"([0-9.]+)\s*(ns|µs|us|ms|s)", raw)
+            times.append(float(match.group(1)) * units[match.group(2)] if match else 0.0)
+        return times
 
     @staticmethod
     def _last(response: dict) -> Any:

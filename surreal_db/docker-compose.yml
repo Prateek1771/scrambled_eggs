@@ -44,15 +44,18 @@ services:
     restart: "no"
 
   # Stateless. Holds the OpenAI key and the privileged database connection; mints
-  # the browser's read-only token. Published on 8080 because the database already
-  # owns 8000 and both listen on 8000 inside the network.
+  # the browser's read-only token. Published on API_PORT (8080 by default)
+  # because the database already owns 8000 and both listen on 8000 inside the
+  # network. Move it with API_PORT if something else on the machine has 8080 --
+  # NEXT_PUBLIC_API_URL has to agree, and the web image needs a rebuild since
+  # that value is inlined at build time.
   api:
     build: ./api
     depends_on:
       migrate:
         condition: service_completed_successfully
     ports:
-      - "8080:8000"
+      - "${API_PORT:-8080}:8000"
     volumes:
       # db/recall.surql is read at runtime. Mounting it rather than copying it at
       # build time means the agent and db/fake_writer.py always run the identical
@@ -61,6 +64,10 @@ services:
     environment:
       RECALL_SURQL_PATH: /db/recall.surql
       SURREAL_URL: ws://surrealdb:8000/rpc
+      # Where the browser reaches the database, handed out by /viewer-token.
+      # Inside the network the host is `surrealdb`; from the user's machine it is
+      # localhost, and only the browser's view matters here.
+      SURREAL_PUBLIC_URL: ${SURREAL_PUBLIC_URL:-ws://localhost:8000/rpc}
       SURREAL_NS: ${SURREAL_NS:-cortex}
       SURREAL_DB: ${SURREAL_DB:-main}
       SURREAL_ROOT_USER: ${SURREAL_ROOT_USER:-root}
@@ -78,6 +85,48 @@ services:
       timeout: 3s
       retries: 12
       start_period: 5s
+
+  # A rich first frame. Rather than maintain a static dump, this replays
+  # tests/corpus.py at its smallest scale -- a simulated engineering organisation
+  # with supersession chains and multi-hop associations already in it, which is
+  # exactly what the graph exists to show. The generator is standard-library
+  # only, so there is nothing to install.
+  #
+  # Set SEED=false to start on an empty graph instead.
+  seed:
+    image: python:3.12-slim
+    profiles: ["", "seed"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./db:/app/db:ro
+      - ./tests:/app/tests:ro
+    working_dir: /app
+    command:
+      - sh
+      - -c
+      - |
+        if [ "$${SEED}" = "false" ]; then echo "seed: skipped (SEED=false)"; exit 0; fi
+        python tests/corpus.py --scale $${SEED_SCALE} --seed 7 --endpoint http://surrealdb:8000
+    environment:
+      SEED: ${SEED:-true}
+      SEED_SCALE: ${SEED_SCALE:-small}
+    restart: "no"
+
+  # The interface. Published on WEB_PORT so the documented default (3000) can be
+  # moved aside on a machine already using it.
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    restart: unless-stopped
 
 volumes:
   surreal-data:

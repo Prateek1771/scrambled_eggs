@@ -50,8 +50,13 @@ def browser_context(request: pytest.FixtureRequest):
 
 
 @pytest.fixture(scope="module")
-def page(browser_context, web_url: str):
+def page(browser_context, web_url: str, corpus):
     """The CORTEX page, loaded and waited on until its live feed is up.
+
+    Depends on `corpus` so the data exists before the page opens. Without it,
+    these tests run against whatever the database happened to hold -- and since
+    this directory sorts first, that is whatever the *previous session* left
+    behind. The assertions then pass or fail on history rather than on the code.
 
     Waiting for the "live" indicator rather than for a fixed delay: the page has
     to fetch a token, open its own socket, register subscriptions and resync

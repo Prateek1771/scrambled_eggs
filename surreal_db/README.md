@@ -9,6 +9,13 @@ The left half of the screen is a chat. The right half is the agent's memory, ren
 that grows and rewires **while you watch**. Not a refresh. Not a poll. The browser is subscribed to
 the same records the agent writes, so a fact appears on screen at the moment it is learned.
 
+![CORTEX building a memory graph in real time](docs/demo.gif)
+
+Nothing in that recording is staged. It is the running application, fed by writes arriving over the
+browser's own WebSocket to SurrealDB — recorded by `scripts/record_demo.py`, which you can run
+yourself. Watch for the node that dims near the end: a fact was contradicted and superseded. It was
+not deleted, and it never will be.
+
 ```mermaid
 flowchart LR
     U["You"] -->|message| A["Agent<br/>LangGraph"]
@@ -72,8 +79,15 @@ docker compose up
 # open http://localhost:3000
 ```
 
-Three containers: `surrealdb`, `api` (Python / FastAPI / LangGraph), `web` (Next.js).
-A seeded memory is included so the graph is interesting on first load.
+Three long-running containers — `surrealdb`, `api` (Python / FastAPI / LangGraph) and `web`
+(Next.js) — plus two one-shot jobs that apply the schema and seed a demo memory, so the graph is
+interesting the moment it loads. `SEED=false` starts on an empty one.
+
+If something already owns port 3000, set `WEB_PORT` in `.env` and open that instead.
+
+`tests/test_quickstart.py` runs exactly the steps above against an empty volume and asserts the page
+comes up with a populated graph — because a quickstart nobody verifies is a quickstart that quietly
+stops working.
 
 The key stays in the `api` container — the browser only ever gets a read-only SurrealDB token.
 Default models are `gpt-5.6-terra` for reasoning, `gpt-5.6-luna` for the cheap consolidation checks,

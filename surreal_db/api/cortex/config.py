@@ -45,6 +45,7 @@ class Settings:
 
     surreal_url: str
     surreal_http: str
+    surreal_public_url: str
     namespace: str
     database: str
     root_user: str
@@ -88,7 +89,17 @@ class Settings:
             logger.warning("could not list models at %s (%s); skipping the check", base, error)
             return
 
-        missing = sorted(name for name in wanted if name not in available)
+        # Gemini's compatibility layer lists ids as `models/gemini-3.8-flash`
+        # while accepting the bare `gemini-3.8-flash` on every call that matters.
+        # Comparing the two literally turns a perfectly working endpoint into a
+        # refusal to boot, so the namespace prefix is dropped on both sides. This
+        # check exists to catch typos, not to enforce one vendor's id spelling.
+        def bare(name: str) -> str:
+            """Strip a provider's id namespace so ids compare across vendors."""
+            return name.rsplit("/", 1)[-1]
+
+        available = {bare(name) for name in available}
+        missing = sorted(name for name in wanted if bare(name) not in available)
         if missing:
             raise ConfigError(
                 f"these models are not available on this account: {', '.join(missing)}. "
@@ -126,6 +137,12 @@ class Settings:
                 .replace("wss://", "https://")
                 .removesuffix("/rpc")
             ),
+            # Where the *browser* reaches the database, which is not where this
+            # process reaches it: inside compose the host is `surrealdb`, and
+            # from a laptop it is localhost. Handed to the browser at runtime by
+            # /viewer-token so the web image stays portable.
+            surreal_public_url=os.environ.get(
+                "SURREAL_PUBLIC_URL", "ws://localhost:8000/rpc"),
             namespace=os.environ.get("SURREAL_NS", "cortex"),
             database=os.environ.get("SURREAL_DB", "main"),
             root_user=os.environ.get("SURREAL_ROOT_USER", "root"),

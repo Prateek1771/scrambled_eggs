@@ -1,0 +1,13 @@
+# Arm B client libraries only. Deliberately not part of api/pyproject.toml --
+# Arm B is benchmark-only infrastructure, not something the shipped API image
+# ever needs. Install with: pip install -r bench/requirements.txt
+#
+# bench/arm_a.py and bench/embeddings.py import api/cortex directly (via
+# sys.path, no install step), so the api package's own dependencies
+# (api/pyproject.toml) must also be installed to run the benchmark.
+
+asyncpg>=0.29
+pgvector>=0.3
+neo4j>=5.24
+elasticsearch>=8.15,<9
+redis>=5.0

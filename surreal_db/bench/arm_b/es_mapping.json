@@ -1,0 +1,24 @@
+{
+  "settings": {
+    "analysis": {
+      "analyzer": {
+        "cortex_text": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding", "snowball"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "fact_id": { "type": "keyword" },
+      "valid": { "type": "boolean" },
+      "text": {
+        "type": "text",
+        "analyzer": "cortex_text",
+        "similarity": "BM25"
+      }
+    }
+  }
+}

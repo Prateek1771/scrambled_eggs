@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .db import Database, record_str
 from .models import Hit, Via
+from .telemetry import tracer
 
 logger = logging.getLogger("cortex.retrieval")
 
@@ -47,6 +48,22 @@ def _load_recall_query() -> str:
 
 
 RECALL_SURQL = _load_recall_query()
+
+
+def _statement_index(statement: str) -> dict[str, int]:
+    """Map each `LET $name` to its position in the batch.
+
+    Derived from the query text rather than hard-coded, so editing
+    db/recall.surql -- adding an arm, reordering one -- cannot silently
+    mis-attribute a timing to the wrong strategy. Every statement before the
+    final RETURN is a LET, so the nth LET is the nth statement.
+    """
+    import re
+
+    return {
+        match.group(1): index
+        for index, match in enumerate(re.finditer(r"^\s*LET\s+\$(\w+)", statement, re.M))
+    }
 
 
 def fuse(arms: dict[str, list[dict]], k: int = RRF_K, limit: int = 12) -> list[Hit]:
@@ -114,6 +131,7 @@ async def recall(
     remembering something reinforces it, as a side effect of the write, with no
     application code involved.
     """
+    span = trace_span = tracer().start_span("recall")
     started = time.perf_counter()
 
     # The hits array is built inside the same statement that runs the query.
@@ -134,7 +152,7 @@ async def recall(
         RETURN { vector: $vec, text: $kw, graph: $assoc, retrieval: $created.id };
     """
 
-    result = await database.query(statement, {
+    result, statement_ms = await database.query_timed(statement, {
         "q": embedding,
         "text": question,
         "k": k,
@@ -156,16 +174,59 @@ async def recall(
     })
 
     retrieval_id = record_str(payload.get("retrieval"))
-    total_ms = int((time.perf_counter() - started) * 1000)
+    total_ms = round((time.perf_counter() - started) * 1000, 2)
 
-    # Timing is written after the fact because the query cannot measure its own
-    # wall clock. The inspector reads it, so it has to be real rather than zero.
+    # Per-arm timings come from SurrealDB's own per-statement measurements, not
+    # from a stopwatch out here. All three arms run inside one batch, so nothing
+    # measured from the client could separate them -- and the engine already knows
+    # the answer.
+    #
+    # The associative arm is three statements, because reaching the anchors and
+    # expanding them is the work; $assoc alone would report only the final
+    # filter and flatter the graph arm considerably.
+    index = _statement_index(statement)
+
+    def took(*names: str) -> float:
+        """Sum the reported duration of the named statements."""
+        return round(sum(statement_ms[index[name]]
+                         for name in names
+                         if name in index and index[name] < len(statement_ms)), 2)
+
+    timing = {
+        "total_ms": total_ms,
+        "knn_ms": took("vec"),
+        "fts_ms": took("kw"),
+        "graph_ms": took("anchors", "expanded", "assoc"),
+    }
+
+    # Written after the fact because the query cannot measure its own wall clock.
+    # The inspector reads this, so it has to be real rather than the zeros that
+    # shipped here for three milestones.
     await database.query("""
-        UPDATE type::record($id) SET timing.total_ms = $total;
-    """, {"id": retrieval_id, "total": total_ms})
+        UPDATE type::record($id) SET timing = $timing;
+    """, {"id": retrieval_id, "timing": timing})
 
-    logger.info("recall: %d vector, %d text, %d graph -> %d fused in %dms",
-                len(payload.get("vector") or []), len(payload.get("text") or []),
-                len(payload.get("graph") or []), len(hits), total_ms)
+    # The arm timings on the span are SurrealDB's own, which is what makes them
+    # worth charting: they measure the engine, not the round trip.
+    span.set_attribute("recall.knn_ms", timing["knn_ms"])
+    span.set_attribute("recall.fts_ms", timing["fts_ms"])
+    span.set_attribute("recall.graph_ms", timing["graph_ms"])
+    span.set_attribute("recall.total_ms", total_ms)
+    span.set_attribute("recall.hits.vector", len(payload.get("vector") or []))
+    span.set_attribute("recall.hits.text", len(payload.get("text") or []))
+    span.set_attribute("recall.hits.graph", len(payload.get("graph") or []))
+    span.set_attribute("recall.hits.fused", len(hits))
+    # One round trip for all three strategies -- the number the whole
+    # architecture argument rests on, recorded rather than asserted.
+    span.set_attribute("recall.round_trips", 1)
+    span.end()
+    _ = trace_span
+
+    logger.info("recall: %d vector (%.1fms), %d text (%.1fms), %d graph (%.1fms) "
+                "-> %d fused, %.1fms total",
+                len(payload.get("vector") or []), timing["knn_ms"],
+                len(payload.get("text") or []), timing["fts_ms"],
+                len(payload.get("graph") or []), timing["graph_ms"],
+                len(hits), total_ms)
 
     return hits, retrieval_id

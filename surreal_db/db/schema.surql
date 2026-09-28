@@ -214,6 +214,45 @@ DEFINE INDEX IF NOT EXISTS ckptw_lookup ON checkpoint_write
     FIELDS thread_id, checkpoint_ns, checkpoint_id;
 
 -- ---------------------------------------------------------------------------
+-- traces
+--
+-- Spans live in the same engine as the memory they describe. The header of the
+-- app reads "1 database (vs 5)"; standing up a separate trace store to observe
+-- it would contradict the only claim this project makes.
+--
+-- SCHEMAFULL with a FLEXIBLE attributes bag: the shape of a span is fixed, but
+-- its attributes are whatever the instrumentation attached.
+--
+-- Deliberately absent: prompt and completion text. Anyone holding a viewer token
+-- can read this table, and the browser holds one -- so conversation content must
+-- not be here. Token counts and model names are, because those are the numbers
+-- worth charting and they leak nothing.
+-- ---------------------------------------------------------------------------
+
+DEFINE TABLE IF NOT EXISTS span SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS trace_id       ON span TYPE string;
+DEFINE FIELD IF NOT EXISTS span_id        ON span TYPE string;
+DEFINE FIELD IF NOT EXISTS parent_span_id ON span TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS name           ON span TYPE string;
+DEFINE FIELD IF NOT EXISTS started_at     ON span TYPE datetime;
+DEFINE FIELD IF NOT EXISTS duration_ms    ON span TYPE float;
+DEFINE FIELD IF NOT EXISTS status         ON span TYPE string DEFAULT "UNSET";
+DEFINE FIELD OVERWRITE     attributes     ON span TYPE object FLEXIBLE;
+
+-- Reassembling one turn's tree is the only read anyone does here, and it is
+-- always by trace.
+DEFINE INDEX IF NOT EXISTS span_trace ON span FIELDS trace_id, started_at;
+
+-- Spans accumulate far faster than memory does and are worth far less. This
+-- keeps the table from growing without bound on a long-running demo; it is the
+-- one table in CORTEX where deleting is correct, because a trace is a
+-- measurement rather than something the agent believes.
+DEFINE EVENT IF NOT EXISTS prune_spans ON TABLE span ASYNC
+    WHEN $event = "CREATE" THEN {
+        DELETE span WHERE started_at < time::now() - 24h;
+    };
+
+-- ---------------------------------------------------------------------------
 -- the browser's credential
 --
 -- The UI holds a direct WebSocket to the database, so it gets an account that

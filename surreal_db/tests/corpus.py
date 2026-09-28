@@ -45,6 +45,20 @@ SCALES: dict[str, dict[str, int]] = {
     "small": {"people": 70, "months": 6, "incidents_per_month": 5},
     "medium": {"people": 270, "months": 18, "incidents_per_month": 16},
     "huge": {"people": 2400, "months": 18, "incidents_per_month": 90},
+    # Below: the M6 benchmark scales (docs/06-benchmark.md). "tiny" is for fast
+    # harness iteration; "bench" is calibrated (via --dry-run) to land near the
+    # doc's 50k facts / 5k entities.
+    "tiny": {"people": 120, "months": 6, "incidents_per_month": 8},
+    "bench": {"people": 4800, "months": 18, "incidents_per_month": 140},
+}
+
+# Target ground-truth query counts per scale, split 40/20/25/15 across
+# semantic/lexical/associative/temporal (docs/06-benchmark.md's "Dataset" table).
+# Scales absent here keep the original small hand-picked counts for backward
+# compatibility with existing tests.
+QUERY_TARGETS: dict[str, dict[str, int]] = {
+    "tiny": {"vector": 40, "text": 20, "graph": 25, "temporal": 15},
+    "bench": {"vector": 400, "text": 200, "graph": 250, "temporal": 150},
 }
 
 START = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -587,8 +601,13 @@ class _Builder:
         they do.
         """
         current = {fact.slug for fact in self.corpus.facts if not fact.superseded_by}
+        # M6 benchmark scales get counts scaled to the doc's 40/20/25/15 split;
+        # every other scale keeps the original small hand-picked counts so
+        # existing tests see no behaviour change.
+        targets = QUERY_TARGETS.get(self.scale)
 
         # Lexical: an identifier that appears in exactly one fact.
+        lexical_target = targets["text"] if targets else 12
         for fact in self.corpus.facts:
             if fact.topic == "incident" and fact.text.startswith("INC-"):
                 incident_id = fact.text.split(":")[0]
@@ -596,23 +615,40 @@ class _Builder:
                 self.corpus.queries.append(GroundTruth(
                     question=incident_id, topic=None, expected=matches, arm="text",
                 ))
-                if len(self.corpus.queries) >= 12:
+                if sum(1 for q in self.corpus.queries if q.arm == "text") >= lexical_target:
                     break
 
-        # Semantic: everything in a topic cluster.
-        for topic in ("incident", "ownership", "expertise"):
-            expected = [f.slug for f in self.corpus.facts
-                        if f.topic == topic and f.slug in current][:40]
-            if expected:
-                self.corpus.queries.append(GroundTruth(
-                    question=f"tell me about {topic}", topic=topic,
-                    expected=expected, arm="vector",
-                ))
+        # Semantic: everything in a topic cluster. At benchmark scales this is
+        # chunked across every topic (not just three) so the count scales with
+        # the corpus instead of staying fixed at three queries.
+        if targets:
+            chunk = 40
+            for topic in TOPICS:
+                topic_facts = [f.slug for f in self.corpus.facts
+                               if f.topic == topic and f.slug in current]
+                for start in range(0, len(topic_facts), chunk):
+                    if sum(1 for q in self.corpus.queries if q.arm == "vector") >= targets["vector"]:
+                        break
+                    self.corpus.queries.append(GroundTruth(
+                        question=f"tell me about {topic}", topic=topic,
+                        expected=topic_facts[start:start + chunk], arm="vector",
+                    ))
+        else:
+            for topic in ("incident", "ownership", "expertise"):
+                expected = [f.slug for f in self.corpus.facts
+                            if f.topic == topic and f.slug in current][:40]
+                if expected:
+                    self.corpus.queries.append(GroundTruth(
+                        question=f"tell me about {topic}", topic=topic,
+                        expected=expected, arm="vector",
+                    ))
 
         # Associative: two hops, and only reachable that way. The answer shares
         # no vocabulary with the question, which is the whole point -- this is
         # the population the `.{1..2}` recursion bug dropped silently.
-        for library, maintainer in list(self.maintainer_of.items())[:10]:
+        graph_target = targets["graph"] if targets else 10
+        candidates = list(self.maintainer_of.items()) if targets else list(self.maintainer_of.items())[:10]
+        for library, maintainer in candidates:
             dependents = [service for service, deps in self.depends_on.items()
                           if library in deps]
             if not dependents:
@@ -630,9 +666,12 @@ class _Builder:
                              f"library {person} maintains",
                     topic=None, expected=expected, arm="graph",
                 ))
+                if sum(1 for q in self.corpus.queries if q.arm == "graph") >= graph_target:
+                    break
 
         # Temporal: a superseded fact is the right answer to a question about the past.
-        superseded = [fact for fact in self.corpus.facts if fact.superseded_by][:10]
+        temporal_target = targets["temporal"] if targets else 10
+        superseded = [fact for fact in self.corpus.facts if fact.superseded_by][:temporal_target]
         for fact in superseded:
             self.corpus.queries.append(GroundTruth(
                 question=f"what did we previously believe: {fact.text[:60]}",
@@ -691,8 +730,15 @@ def reset(**connection) -> None:
     """, **connection)
 
 
-def load(corpus: Corpus, progress: bool = False, **connection) -> dict[str, float]:
+def load(corpus: Corpus, progress: bool = False,
+         embeddings: dict[str, list[float]] | None = None,
+         **connection) -> dict[str, float]:
     """Write a corpus to SurrealDB and return timings for each phase.
+
+    `embeddings`, when given, maps fact slug -> real embedding vector (e.g. from
+    `bench/embeddings.py`) and is used instead of the deterministic fake `near()`
+    vector below. Every existing caller passes nothing and keeps the fast, free,
+    fully-deterministic fake-embedding behaviour unchanged.
 
     Entities go in before facts and facts before edges, so no edge is ever
     written against an endpoint that does not exist yet -- `RELATE` would happily
@@ -733,8 +779,11 @@ def load(corpus: Corpus, progress: bool = False, **connection) -> dict[str, floa
             "text": fact.text,
             # Facts in the same topic cluster land near each other; the jitter is
             # what stops a cluster collapsing to a single point and makes
-            # ranking within a cluster meaningful.
-            "embedding": near(TOPICS[fact.topic], 0.55),
+            # ranking within a cluster meaningful. Real embeddings (bench mode)
+            # already cluster by actual semantic content, so they pass straight
+            # through instead.
+            "embedding": embeddings[fact.slug] if embeddings is not None
+                         else near(TOPICS[fact.topic], 0.55),
             "confidence": fact.confidence,
             "valid_from": timestamp(fact.month),
             "mentions": fact.mentions,

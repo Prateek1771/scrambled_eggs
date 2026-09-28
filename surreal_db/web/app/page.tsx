@@ -54,6 +54,16 @@ export default function Page() {
         </div>
       )}
 
+      {/* Resyncing is brief but must not be silent: it is the one moment the
+          graph on screen is knowingly behind the database, and a stale graph
+          that looks healthy is worse than one that flickers. */}
+      {status === "resyncing" && (
+        <div className="shimmer bg-[var(--color-primary)]/10 px-6 py-1.5 text-[11px]
+                        text-[var(--color-primary)]">
+          reconnected — reconciling against a full read of the database
+        </div>
+      )}
+
       <div className="flex min-h-0 flex-1">
         <section className="flex w-[26rem] shrink-0 flex-col border-r border-[var(--color-border)]">
           <Chat apiUrl={API_URL} onFocusFact={setSelected} />

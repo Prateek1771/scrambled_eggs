@@ -30,20 +30,28 @@ from pydantic import BaseModel
 from .config import ConfigError, Settings
 from .db import Database, one, record_str
 from .graph import build_agent
+from .telemetry import setup_telemetry, tracer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cortex")
 
 
 class ViewerToken(BaseModel):
-    """A browser-usable SurrealDB credential and the deadline for replacing it.
+    """Everything the browser needs to open its own connection to the database.
 
     `expires_at` is a wall-clock unix timestamp rather than a duration because
     the client refreshes *ahead* of expiry, and a duration would need re-anchoring
     to the moment of receipt on every hop.
+
+    `url` is here so the web image does not have to know where the database is.
+    `NEXT_PUBLIC_*` variables are inlined at build time, so baking a database URL
+    into the bundle produces an image that only works on the machine that built
+    it. Asking the API at runtime removes the coupling entirely -- the browser
+    learns where to connect from the same response that tells it how.
     """
 
     token: str
+    url: str
     namespace: str
     database: str
     expires_at: float
@@ -108,6 +116,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ) from error
 
             await settings.verify_models()
+            provider = setup_telemetry(settings)
 
             database = Database(settings)
             await database.connect()
@@ -120,6 +129,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 yield
             finally:
                 await database.close()
+                if provider is not None:
+                    # Without this the last batch is dropped on exit -- exactly the
+                    # spans you want after a crash.
+                    provider.shutdown()
 
     app = FastAPI(title="CORTEX", lifespan=lifespan)
 
@@ -177,7 +190,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # default and erring short only costs an extra refresh.
             expires_at = time.time() + 3600.0
 
-        return ViewerToken(token=token, namespace=settings.namespace,
+        return ViewerToken(token=token, url=settings.surreal_public_url,
+                           namespace=settings.namespace,
                            database=settings.database, expires_at=expires_at)
 
     @app.post("/session")
@@ -218,6 +232,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             """Drive the graph, emitting one SSE per completed node."""
             yield _event("start", {"session_id": session_id, "thread_id": thread_id})
             answer = ""
+            turn = tracer().start_span("turn")
+            turn.set_attribute("cortex.session_id", session_id)
+            turn.set_attribute("cortex.thread_id", thread_id)
             try:
                 async for update in app.state.agent.astream(
                     {"query": request.message, "session_id": session_id,
@@ -250,9 +267,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # Memory already committed is not rolled back by a failed
                 # response. That is deliberate: the facts were true when written.
                 logger.exception("turn failed")
+                turn.set_attribute("error", True)
+                turn.end()
                 yield _event("error", {"message": str(error)})
                 return
 
+            turn.end()
             yield _event("done", {"answer": answer})
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={

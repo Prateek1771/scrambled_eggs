@@ -1,0 +1,65 @@
+name: cortex-bench-arm-b
+
+# Arm B of the M6 benchmark (docs/06-benchmark.md): the "conventional stack"
+# CORTEX's single SurrealDB is compared against. Brought up alongside the root
+# docker-compose.yml's `surrealdb` (Arm A), never in place of it:
+#
+#   docker compose up -d --wait surrealdb          # Arm A
+#   docker compose -f bench/docker-compose.yml up -d --wait   # Arm B
+#
+# Every port is offset from both the store's own default and from CORTEX's
+# ports, so this can run on a machine already running either.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  neo4j:
+    image: neo4j:5.24
+    environment:
+      NEO4J_AUTH: neo4j/benchbench
+    ports:
+      - "7688:7687"
+      - "7475:7474"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7474 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 10s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports:
+      - "9201:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

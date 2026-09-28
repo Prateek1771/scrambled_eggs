@@ -90,3 +90,25 @@ pre.surql {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* Resync banner. A slow sweep rather than a spinner: the graph underneath stays
+   interactive, and this is a reconciliation in progress, not a blocked UI. */
+@keyframes shimmer-sweep {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.shimmer {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--color-primary) 18%, transparent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer-sweep 1.6s linear infinite;
+}

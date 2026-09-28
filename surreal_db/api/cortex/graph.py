@@ -25,6 +25,9 @@ from .consolidate import consolidate
 from .db import Database, one, record_str
 from .models import CortexState, Extracted, ReasonOutput
 from .retrieval import recall
+from .telemetry import (
+    GEN_AI_INPUT_TOKENS, GEN_AI_MODEL, GEN_AI_OUTPUT_TOKENS, GEN_AI_SYSTEM, tracer,
+)
 from .tools import build_tools
 
 logger = logging.getLogger("cortex.graph")
@@ -65,11 +68,32 @@ def build_agent(settings: Settings, database: Database):
                      api_key=settings.openai_api_key, base_url=settings.openai_base_url)
     llm_fast = ChatOpenAI(model=settings.llm_model_fast, temperature=0.0,
                           api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+    # Two arguments here exist only so OPENAI_BASE_URL is a real switch rather
+    # than a decoration.
+    #
+    # check_embedding_ctx_length=False: by default OpenAIEmbeddings tokenises
+    # with tiktoken and posts *token ids* instead of strings. api.openai.com
+    # accepts that; Gemini, Ollama, vLLM and TEI reject it, and the failure
+    # arrives as an opaque 400 from inside the SDK rather than anything naming
+    # the cause. Sending raw text costs nothing against OpenAI, which tokenises
+    # server-side anyway.
+    #
+    # dimensions: the HNSW index declares its width at definition time and can
+    # never be widened afterwards, so the embedding client has to be *asked* for
+    # EMBED_DIM rather than trusted to emit it. text-embedding-3-small happens to
+    # emit 1536 natively; gemini-embedding-001 emits 3072 unless told otherwise,
+    # and silently writing 3072-wide vectors at a 1536-wide index is a migration
+    # failure discovered on the first message.
     embed = OpenAIEmbeddings(model=settings.embed_model, api_key=settings.openai_api_key,
-                             base_url=settings.openai_base_url)
+                             base_url=settings.openai_base_url,
+                             dimensions=settings.embed_dim,
+                             check_embedding_ctx_length=False)
 
     tools = build_tools(database, embed)
-    reasoner = llm.bind_tools(tools).with_structured_output(ReasonOutput)
+    # include_raw keeps the underlying AIMessage alongside the parsed model, which
+    # is the only way to read token usage -- and "tokens per completed task" is a
+    # metric docs/06 asks for and nothing could answer.
+    reasoner = llm.bind_tools(tools).with_structured_output(ReasonOutput, include_raw=True)
 
     async def perceive(state: CortexState) -> dict:
         """Write the user's turn and embed it.
@@ -126,10 +150,25 @@ def build_agent(settings: Settings, database: Database):
         else:
             context = "  (nothing recalled -- this may be the first thing you are told)"
 
-        result: ReasonOutput = await reasoner.ainvoke([
-            ("system", SYSTEM_PROMPT),
-            ("human", f"Recalled facts:\n{context}\n\nUser said: {state['query']}"),
-        ])
+        with tracer().start_as_current_span("reason") as span:
+            span.set_attribute(GEN_AI_SYSTEM, "openai")
+            span.set_attribute(GEN_AI_MODEL, settings.llm_model)
+            span.set_attribute("cortex.recalled", len(recalled))
+            span.set_attribute("cortex.loop", state.get("loops", 0))
+
+            envelope = await reasoner.ainvoke([
+                ("system", SYSTEM_PROMPT),
+                ("human", f"Recalled facts:\n{context}\n\nUser said: {state['query']}"),
+            ])
+            result: ReasonOutput = envelope["parsed"]
+
+            # Token counts only. Prompt and completion text stay out of the span
+            # table, which anyone holding a viewer token can read -- and the
+            # browser holds one.
+            usage = getattr(envelope.get("raw"), "usage_metadata", None) or {}
+            span.set_attribute(GEN_AI_INPUT_TOKENS, usage.get("input_tokens", 0))
+            span.set_attribute(GEN_AI_OUTPUT_TOKENS, usage.get("output_tokens", 0))
+            span.set_attribute("cortex.extracted", len(result.extracted))
 
         return {
             "answer": result.answer,
@@ -149,12 +188,20 @@ def build_agent(settings: Settings, database: Database):
         if not raw:
             return {"outcomes": []}
 
-        facts = [Extracted(**item) for item in raw]
-        vectors = await embed.aembed_documents([fact.text for fact in facts])
+        with tracer().start_as_current_span("consolidate") as span:
+            facts = [Extracted(**item) for item in raw]
+            span.set_attribute("cortex.facts", len(facts))
 
-        outcomes = await consolidate(
-            database, llm_fast, facts, vectors, state["message_id"],  # type: ignore[typeddict-item]
-        )
+            vectors = await embed.aembed_documents([fact.text for fact in facts])
+            span.set_attribute(GEN_AI_MODEL, settings.embed_model)
+
+            outcomes = await consolidate(
+                database, llm_fast, facts, vectors,
+                state["message_id"],  # type: ignore[typeddict-item]
+            )
+            for action in ("create", "supersede", "duplicate", "failed"):
+                span.set_attribute(f"cortex.{action}",
+                                   sum(1 for o in outcomes if o.get("action") == action))
         return {"outcomes": outcomes}
 
     async def respond(state: CortexState) -> dict:

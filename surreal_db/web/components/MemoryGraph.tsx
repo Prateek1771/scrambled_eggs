@@ -227,8 +227,22 @@ export function MemoryGraph({
     ctx.restore();
   }
 
+  // Nothing is truncated -- quiet facts are drawn faintly -- but docs/05 is
+  // explicit that the reduction must be *stated*, because a graph that silently
+  // shows less than it holds is indistinguishable from one that lost records.
+  const faded = data.nodes.length > CROWDED_ABOVE
+    ? data.nodes.filter((node) => node.kind === "fact" && node.salience < 1.02 && !node.glow).length
+    : 0;
+
   return (
     <div ref={container} className="relative h-full w-full">
+      {faded > 0 && (
+        <div className="pointer-events-none absolute left-4 top-3 z-10 text-[10px]
+                        text-[var(--color-muted)]">
+          {faded.toLocaleString()} quiet {faded === 1 ? "fact" : "facts"} faded — still
+          present, still clickable
+        </div>
+      )}
       <ForceGraph2D
         ref={engine as never}
         graphData={data}

@@ -104,7 +104,9 @@ export function useLiveMemory(surrealUrl: string, apiUrl: string): LiveMemory {
         const auth = await fetchViewerToken(apiUrl);
         if (cancelled) return;
 
-        connection = await connect(surrealUrl, auth, enqueue, (state) => {
+        // The API's answer wins; the prop is only a fallback for running the web
+        // app outside compose against a database somewhere else.
+        connection = await connect(auth.url || surrealUrl, auth, enqueue, (state) => {
           // The socket died and the SDK is bringing it back by itself. Our live
           // subscriptions do not survive that, so a transparent recovery has to
           // be turned into an explicit re-register and resync -- otherwise the

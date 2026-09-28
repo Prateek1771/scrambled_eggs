@@ -265,6 +265,15 @@ export type LiveStatus = "connecting" | "live" | "reconnecting" | "resyncing" | 
 
 export type ViewerToken = {
   token: string;
+  /**
+   * Where to open the database socket, told to us by the API at runtime.
+   *
+   * Not a `NEXT_PUBLIC_*` variable: those are inlined at build time, so baking a
+   * database URL into the bundle produces an image that only works on the
+   * machine that built it. The API knows both its own address and the browser's,
+   * so it answers this question instead.
+   */
+  url?: string;
   namespace: string;
   database: string;
   expires_at: number;
